@@ -557,8 +557,29 @@ function bundleFiles(
   allDeps: Record<string, string>
 ): string {
   const visited = new Set<string>();
-  const bundled: string[] = [];
-  const externals = new Set<string>();
+  const modules: { path: string; code: string }[] = [];
+  const externals = new Map<string, string>(); // url -> varName
+  
+  function sanitizeVarName(name: string): string {
+    return name.replace(/[^a-zA-Z0-9_]/g, '_').replace(/^_+/, '').replace(/_+$/, '');
+  }
+  
+  function getExternalVarName(importPath: string): string {
+    // Common mappings
+    if (importPath === 'react') return 'React';
+    if (importPath === 'react-dom' || importPath === 'react-dom/client') return 'ReactDOM';
+    if (importPath === 'react-router-dom') return 'ReactRouterDOM';
+    if (importPath === 'lucide-react') return 'LucideReact';
+    if (importPath === '@tanstack/react-query') return 'ReactQuery';
+    if (importPath === 'sonner') return 'Sonner';
+    if (importPath === 'recharts') return 'Recharts';
+    if (importPath === 'framer-motion') return 'FramerMotion';
+    if (importPath === 'date-fns') return 'dateFns';
+    if (importPath === 'clsx') return 'clsx';
+    if (importPath === 'class-variance-authority') return 'cva';
+    if (importPath === 'tailwind-merge') return 'tailwindMerge';
+    return sanitizeVarName(importPath.split('/').pop() || importPath);
+  }
   
   function processFile(filePath: string) {
     if (visited.has(filePath) || !sourceFiles[filePath]) return;
@@ -566,40 +587,102 @@ function bundleFiles(
     
     let code = sourceFiles[filePath];
     
-    // Extract and process imports
-    const importRegex = /import\s+(?:(\{[^}]+\})|(\*\s+as\s+\w+)|(\w+))?\s*,?\s*(?:(\{[^}]+\})|(\w+))?\s*from\s+['"]([^'"]+)['"]/g;
-    const imports: string[] = [];
+    // First pass: collect and process all imports
+    const importRegex = /import\s+(?:(\{[^}]+\})|(\*\s+as\s+\w+)|(\w+))?\s*,?\s*(?:(\{[^}]+\})|(\w+))?\s*from\s+['"]([^'"]+)['"];?/g;
+    const localImports: string[] = [];
     
     code = code.replace(importRegex, (match, named1, star, defaultImport, named2, defaultImport2, importPath) => {
+      // Skip type-only imports
+      if (match.includes('import type')) return '';
+      
       const { resolved, isExternal } = resolveImport(importPath, filePath, sourceFiles, monorepoInfo, packageJson, allDeps);
       
       if (isExternal) {
-        externals.add(resolved);
-        // Keep external imports but update the path
-        return match.replace(importPath, resolved);
+        const varName = getExternalVarName(importPath);
+        if (!externals.has(importPath)) {
+          externals.set(importPath, varName);
+        }
+        
+        // Handle different import styles
+        const actualDefault = defaultImport || defaultImport2;
+        const actualNamed = named1 || named2;
+        
+        let result = '';
+        if (actualDefault && actualNamed) {
+          // import Default, { Named } from 'pkg'
+          const namedParts = actualNamed.slice(1, -1).split(',').map((n: string) => n.trim().split(' as ').map((p: string) => p.trim())).map(([orig, alias]: [string, string | undefined]) => `${alias || orig} = ${varName}.${orig}`).join(', ');
+          result = `const ${actualDefault} = ${varName}.default || ${varName};\nconst ${namedParts};`;
+        } else if (actualDefault) {
+          result = `const ${actualDefault} = ${varName}.default || ${varName};`;
+        } else if (actualNamed) {
+          const namedImports = actualNamed.slice(1, -1).split(',').map((n: string) => n.trim()).filter((n: string) => n && !n.startsWith('type '));
+          if (namedImports.length === 0) return '';
+          result = namedImports.map((n: string) => {
+            const parts = n.split(' as ').map((p: string) => p.trim());
+            const orig = parts[0];
+            const alias = parts[1];
+            return `const ${alias || orig} = ${varName}.${orig};`;
+          }).join('\n');
+        } else if (star) {
+          const starAlias = star.replace('* as ', '').trim();
+          result = `const ${starAlias} = ${varName};`;
+        }
+        return result;
       } else {
-        // Process local file
+        // Process local file first (dependencies before dependents)
         processFile(resolved);
-        // Remove the import (will be available in bundled scope)
-        return `// bundled: ${importPath}`;
+        localImports.push(resolved);
+        return `// included from: ${importPath}`;
       }
     });
     
-    // Transform the code
+    // Remove export statements and track what's exported
+    code = code.replace(/export\s+default\s+/g, 'const __default__ = ');
+    code = code.replace(/export\s+\{[^}]*\};?/g, '');
+    code = code.replace(/export\s+(const|let|var|function|class)\s+/g, '$1 ');
+    
+    // Transform TypeScript types
     code = transformCode(code, filePath);
     
-    bundled.push(`// === ${filePath} ===\n${code}`);
+    modules.push({ path: filePath, code });
   }
   
   processFile(entryPoint);
   
-  // Build external imports header
-  const externalImports = Array.from(externals).map(url => {
-    const pkgName = url.replace('https://esm.sh/', '').replace(/@[^/]+$/, '');
-    return `import * as ${pkgName.replace(/[^a-zA-Z0-9]/g, '_')} from "${url}";`;
-  }).join('\n');
+  // Build the final bundle
+  const reactVersion = getDependencyVersion("react", packageJson, allDeps);
   
-  return externalImports + '\n\n' + bundled.join('\n\n');
+  // Core external imports that are always needed
+  const coreImports = `
+import React from "https://esm.sh/react@${reactVersion}";
+import ReactDOM from "https://esm.sh/react-dom@${reactVersion}/client";
+`;
+  
+  // Other external imports
+  const otherImports = Array.from(externals.entries())
+    .filter(([pkg]) => pkg !== 'react' && pkg !== 'react-dom' && pkg !== 'react-dom/client')
+    .map(([pkg, varName]) => {
+      const version = getDependencyVersion(pkg.split('/')[0], packageJson, allDeps);
+      const pkgPath = pkg.includes('/') ? pkg : pkg;
+      return `import * as ${varName} from "https://esm.sh/${pkgPath}@${version}?external=react";`;
+    })
+    .join('\n');
+  
+  // Combine all modules
+  const bundledCode = modules.map(m => `\n// === ${m.path} ===\n${m.code}`).join('\n');
+  
+  // Add the mount code at the end
+  const mountCode = `
+// Mount the app
+const root = ReactDOM.createRoot(document.getElementById('root'));
+if (typeof App !== 'undefined') {
+  root.render(React.createElement(App));
+} else if (typeof __default__ !== 'undefined') {
+  root.render(React.createElement(__default__));
+}
+`;
+  
+  return coreImports + otherImports + bundledCode + mountCode;
 }
 
 function generateHtml(jsFileName: string, cssFileName: string): string {
@@ -618,8 +701,8 @@ function generateHtml(jsFileName: string, cssFileName: string): string {
 </html>`;
 }
 
-function generateInlineHtml(bundledJs: string, bundledCss: string, reactVersion: string): string {
-  // For inline HTML, we use esm.sh imports at runtime
+function generateInlineHtml(bundledJs: string, bundledCss: string, _reactVersion: string): string {
+  // The bundledJs already includes all imports from esm.sh
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -633,9 +716,6 @@ ${bundledCss}
 <body>
   <div id="root"></div>
   <script type="module">
-import React from "https://esm.sh/react@${reactVersion}";
-import ReactDOM from "https://esm.sh/react-dom@${reactVersion}/client";
-
 ${bundledJs}
   </script>
 </body>
