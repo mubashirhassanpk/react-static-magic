@@ -15,6 +15,7 @@ interface BuildStats {
   bundleSize: number;
   cssSize: number;
   zipSize: number;
+  tailwindClasses: number;
   dependencies: number;
   devDependencies: number;
 }
