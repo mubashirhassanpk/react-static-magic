@@ -84,30 +84,198 @@ function parseZip(data: Uint8Array): Map<string, Uint8Array> {
 
 interface PackageJson {
   name?: string;
+  version?: string;
   dependencies?: Record<string, string>;
   devDependencies?: Record<string, string>;
+  workspaces?: string[] | { packages: string[] };
+  private?: boolean;
+}
+
+interface WorkspacePackage {
+  name: string;
+  path: string;
+  packageJson: PackageJson;
+  entryPoint: string | null;
+}
+
+interface MonorepoInfo {
+  isMonorepo: boolean;
+  rootPackageJson: PackageJson | null;
+  packages: WorkspacePackage[];
+  allDependencies: Record<string, string>;
+}
+
+function parsePackageJsonAt(files: Map<string, Uint8Array>, path: string): PackageJson | null {
+  const content = files.get(path);
+  if (!content) return null;
+  
+  try {
+    return JSON.parse(new TextDecoder().decode(content)) as PackageJson;
+  } catch (e) {
+    log(`Failed to parse ${path}: ${e}`, "warn");
+    return null;
+  }
 }
 
 function parsePackageJson(files: Map<string, Uint8Array>): PackageJson | null {
-  const content = files.get("package.json");
-  if (!content) {
-    log("No package.json found", "warn");
-    return null;
-  }
-  
-  try {
-    const parsed = JSON.parse(new TextDecoder().decode(content)) as PackageJson;
+  const parsed = parsePackageJsonAt(files, "package.json");
+  if (parsed) {
     log(`Parsed package.json: ${parsed.name || "unnamed"}`);
-    return parsed;
-  } catch (e) {
-    log(`Failed to parse package.json: ${e}`, "error");
-    return null;
+  } else {
+    log("No package.json found", "warn");
   }
+  return parsed;
 }
 
-function getDependencyVersion(dep: string, packageJson: PackageJson | null): string {
+// Detect monorepo structure and find all workspace packages
+function detectMonorepo(files: Map<string, Uint8Array>): MonorepoInfo {
+  const rootPackageJson = parsePackageJsonAt(files, "package.json");
+  const result: MonorepoInfo = {
+    isMonorepo: false,
+    rootPackageJson,
+    packages: [],
+    allDependencies: {}
+  };
+  
+  if (!rootPackageJson) return result;
+  
+  // Check for workspace definitions
+  let workspacePatterns: string[] = [];
+  
+  // npm/yarn workspaces in package.json
+  if (rootPackageJson.workspaces) {
+    if (Array.isArray(rootPackageJson.workspaces)) {
+      workspacePatterns = rootPackageJson.workspaces;
+    } else if (rootPackageJson.workspaces.packages) {
+      workspacePatterns = rootPackageJson.workspaces.packages;
+    }
+  }
+  
+  // Check for pnpm-workspace.yaml
+  const pnpmWorkspace = files.get("pnpm-workspace.yaml");
+  if (pnpmWorkspace) {
+    const content = new TextDecoder().decode(pnpmWorkspace);
+    const packagesMatch = content.match(/packages:\s*\n((?:\s+-\s*.+\n?)+)/);
+    if (packagesMatch) {
+      const patterns = packagesMatch[1].split('\n')
+        .map(line => line.replace(/^\s+-\s*['"]?([^'"]+)['"]?\s*$/, '$1').trim())
+        .filter(p => p);
+      workspacePatterns.push(...patterns);
+    }
+  }
+  
+  // Check for lerna.json
+  const lernaJson = files.get("lerna.json");
+  if (lernaJson) {
+    try {
+      const lerna = JSON.parse(new TextDecoder().decode(lernaJson));
+      if (lerna.packages) {
+        workspacePatterns.push(...lerna.packages);
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+  
+  if (workspacePatterns.length === 0) {
+    // Not a monorepo, collect dependencies from root
+    result.allDependencies = {
+      ...rootPackageJson.dependencies,
+      ...rootPackageJson.devDependencies
+    };
+    return result;
+  }
+  
+  result.isMonorepo = true;
+  log(`Detected monorepo with patterns: ${workspacePatterns.join(", ")}`);
+  
+  // Collect root dependencies
+  result.allDependencies = {
+    ...rootPackageJson.dependencies,
+    ...rootPackageJson.devDependencies
+  };
+  
+  // Find all directories that match workspace patterns
+  const allPaths = Array.from(files.keys());
+  const packageJsonPaths = allPaths.filter(p => p.endsWith("package.json") && p !== "package.json");
+  
+  for (const pkgPath of packageJsonPaths) {
+    const dirPath = pkgPath.replace("/package.json", "");
+    
+    // Check if this path matches any workspace pattern
+    const matches = workspacePatterns.some(pattern => {
+      // Handle glob patterns like "packages/*" or "apps/*"
+      const regexPattern = pattern
+        .replace(/\*/g, "[^/]+")
+        .replace(/\*\*/g, ".*");
+      return new RegExp(`^${regexPattern}$`).test(dirPath);
+    });
+    
+    if (matches) {
+      const pkgJson = parsePackageJsonAt(files, pkgPath);
+      if (pkgJson) {
+        // Find entry point for this package
+        const entryPoints = [
+          `${dirPath}/src/main.tsx`,
+          `${dirPath}/src/main.jsx`,
+          `${dirPath}/src/index.tsx`,
+          `${dirPath}/src/index.jsx`,
+          `${dirPath}/index.tsx`,
+          `${dirPath}/index.jsx`,
+        ];
+        
+        let entryPoint: string | null = null;
+        for (const ep of entryPoints) {
+          if (files.has(ep)) {
+            entryPoint = ep;
+            break;
+          }
+        }
+        
+        result.packages.push({
+          name: pkgJson.name || dirPath,
+          path: dirPath,
+          packageJson: pkgJson,
+          entryPoint
+        });
+        
+        // Merge dependencies
+        result.allDependencies = {
+          ...result.allDependencies,
+          ...pkgJson.dependencies,
+          ...pkgJson.devDependencies
+        };
+        
+        log(`Found workspace package: ${pkgJson.name || dirPath}`);
+      }
+    }
+  }
+  
+  // Sort packages - apps typically come first
+  result.packages.sort((a, b) => {
+    const aIsApp = a.path.includes("app") || a.path.includes("web") || a.entryPoint !== null;
+    const bIsApp = b.path.includes("app") || b.path.includes("web") || b.entryPoint !== null;
+    if (aIsApp && !bIsApp) return -1;
+    if (!aIsApp && bIsApp) return 1;
+    return a.path.localeCompare(b.path);
+  });
+  
+  log(`Found ${result.packages.length} workspace packages`);
+  
+  return result;
+}
+
+function getDependencyVersion(dep: string, packageJson: PackageJson | null, allDeps?: Record<string, string>): string {
+  // First check allDeps (merged from all workspace packages)
+  if (allDeps && allDeps[dep]) {
+    return allDeps[dep].replace(/^[\^~><=]+/, "").replace(/^workspace:\*?/, "");
+  }
   const version = packageJson?.dependencies?.[dep] || packageJson?.devDependencies?.[dep];
   if (version) {
+    // Handle workspace protocol
+    if (version.startsWith("workspace:")) {
+      return "latest";
+    }
     return version.replace(/^[\^~><=]+/, "");
   }
   return "latest";
@@ -882,22 +1050,51 @@ Deno.serve(async (req) => {
       );
     }
 
-    log("Parsing package.json for dependencies...");
-    const packageJson = parsePackageJson(files);
+    // Detect monorepo structure
+    log("Analyzing project structure...");
+    const monorepoInfo = detectMonorepo(files);
+    const packageJson = monorepoInfo.rootPackageJson;
+    const allDeps = monorepoInfo.allDependencies;
     
-    if (packageJson) {
-      const depCount = Object.keys(packageJson.dependencies || {}).length;
-      const devDepCount = Object.keys(packageJson.devDependencies || {}).length;
-      log(`Found ${depCount} dependencies and ${devDepCount} dev dependencies`);
+    if (monorepoInfo.isMonorepo) {
+      log(`Monorepo detected with ${monorepoInfo.packages.length} packages`);
+      const pkgNames = monorepoInfo.packages.map(p => p.name).slice(0, 5);
+      log(`Packages: ${pkgNames.join(", ")}${monorepoInfo.packages.length > 5 ? "..." : ""}`);
     }
-
-    const entryPoints = ["src/main.tsx", "src/main.jsx", "src/index.tsx", "src/index.jsx", "main.tsx", "main.jsx"];
-    let entryPoint: string | null = null;
     
-    for (const ep of entryPoints) {
-      if (files.has(ep)) {
-        entryPoint = ep;
-        break;
+    const depCount = Object.keys(allDeps).length;
+    log(`Total dependencies across all packages: ${depCount}`);
+
+    // Find entry point - prefer monorepo app packages, then standard locations
+    let entryPoint: string | null = null;
+    let entryPackage: WorkspacePackage | null = null;
+    
+    if (monorepoInfo.isMonorepo && monorepoInfo.packages.length > 0) {
+      // Find the first package with an entry point (prioritizes apps)
+      for (const pkg of monorepoInfo.packages) {
+        if (pkg.entryPoint) {
+          entryPoint = pkg.entryPoint;
+          entryPackage = pkg;
+          log(`Using entry point from workspace package: ${pkg.name}`);
+          break;
+        }
+      }
+    }
+    
+    // Fallback to standard entry points
+    if (!entryPoint) {
+      const standardEntryPoints = [
+        "src/main.tsx", "src/main.jsx", "src/index.tsx", "src/index.jsx",
+        "main.tsx", "main.jsx", "index.tsx", "index.jsx",
+        "app/main.tsx", "app/src/main.tsx", "apps/web/src/main.tsx",
+        "packages/app/src/main.tsx", "packages/web/src/main.tsx"
+      ];
+      
+      for (const ep of standardEntryPoints) {
+        if (files.has(ep)) {
+          entryPoint = ep;
+          break;
+        }
       }
     }
 
@@ -905,7 +1102,7 @@ Deno.serve(async (req) => {
       log("No entry point found", "error");
       await supabase.from("build_jobs").update({ 
         status: "failed", 
-        error_message: "No entry point found (src/main.tsx, etc.)",
+        error_message: "No entry point found. For monorepos, ensure at least one package has src/main.tsx",
         completed_at: new Date().toISOString()
       }).eq("id", jobId);
       return new Response(
@@ -931,17 +1128,26 @@ Deno.serve(async (req) => {
     
     log(`Processing ${sourceFileCount} source files`);
 
-    // Extract CSS variables from index.css if present
+    // Extract CSS variables from index.css if present (check multiple locations for monorepos)
     let cssVars = "";
-    const indexCss = files.get("src/index.css");
-    if (indexCss) {
-      const cssContent = new TextDecoder().decode(indexCss);
-      // Extract :root and .dark CSS variable blocks
-      const rootMatch = cssContent.match(/:root\s*\{[^}]+\}/g);
-      const darkMatch = cssContent.match(/\.dark\s*\{[^}]+\}/g);
-      if (rootMatch) cssVars += rootMatch.join('\n') + '\n';
-      if (darkMatch) cssVars += darkMatch.join('\n') + '\n';
-      log("Extracted CSS variables from index.css");
+    const cssLocations = [
+      "src/index.css",
+      entryPackage ? `${entryPackage.path}/src/index.css` : null,
+      "app/src/index.css",
+      "packages/app/src/index.css"
+    ].filter(Boolean) as string[];
+    
+    for (const cssPath of cssLocations) {
+      const indexCss = files.get(cssPath);
+      if (indexCss) {
+        const cssContent = new TextDecoder().decode(indexCss);
+        const rootMatch = cssContent.match(/:root\s*\{[^}]+\}/g);
+        const darkMatch = cssContent.match(/\.dark\s*\{[^}]+\}/g);
+        if (rootMatch) cssVars += rootMatch.join('\n') + '\n';
+        if (darkMatch) cssVars += darkMatch.join('\n') + '\n';
+        log(`Extracted CSS variables from ${cssPath}`);
+        break;
+      }
     }
 
     // Extract Tailwind classes and generate CSS
@@ -972,6 +1178,7 @@ Deno.serve(async (req) => {
       const virtualFs: esbuild.Plugin = {
         name: "virtual-fs",
         setup(build) {
+          // Resolve relative imports
           build.onResolve({ filter: /^\./ }, (args) => {
             const basedir = args.importer ? args.importer.replace(/\/[^/]+$/, "") : "";
             let resolved = `${basedir}/${args.path}`.replace(/\/+/g, "/").replace(/^\//, "");
@@ -986,6 +1193,7 @@ Deno.serve(async (req) => {
             return { path: resolved, namespace: "virtual" };
           });
           
+          // Resolve src/ imports
           build.onResolve({ filter: /^src\// }, (args) => {
             const extensions = ["", ".tsx", ".ts", ".jsx", ".js", "/index.tsx", "/index.ts"];
             for (const ext of extensions) {
@@ -994,17 +1202,58 @@ Deno.serve(async (req) => {
                 return { path: candidate, namespace: "virtual" };
               }
             }
+            // For monorepos, also check in the entry package's directory
+            if (entryPackage) {
+              for (const ext of extensions) {
+                const candidate = `${entryPackage.path}/${args.path}${ext}`;
+                if (sourceFiles[candidate]) {
+                  return { path: candidate, namespace: "virtual" };
+                }
+              }
+            }
             return { path: args.path, namespace: "virtual" };
           });
           
-          build.onResolve({ filter: /^[^./]/ }, (args) => {
+          // Resolve workspace package imports (e.g., @myorg/shared)
+          build.onResolve({ filter: /^@[^/]+\/[^/]+/ }, (args) => {
+            const pkgName = args.path;
+            
+            // Check if this is a workspace package
+            const workspacePkg = monorepoInfo.packages.find(p => p.name === pkgName);
+            if (workspacePkg) {
+              // Try to find the entry point for this package
+              const entryPaths = [
+                `${workspacePkg.path}/src/index.tsx`,
+                `${workspacePkg.path}/src/index.ts`,
+                `${workspacePkg.path}/index.tsx`,
+                `${workspacePkg.path}/index.ts`,
+              ];
+              for (const ep of entryPaths) {
+                if (sourceFiles[ep]) {
+                  log(`Resolved workspace package ${pkgName} to ${ep}`);
+                  return { path: ep, namespace: "virtual" };
+                }
+              }
+            }
+            
+            // Not a workspace package, resolve from CDN
             if (args.path.startsWith("https://")) {
               return { path: args.path, external: true };
             }
-            const version = getDependencyVersion(args.path, packageJson);
+            const version = getDependencyVersion(args.path, packageJson, allDeps);
             return { path: `https://esm.sh/${args.path}@${version}`, external: true };
           });
           
+          // Resolve bare imports to esm.sh
+          build.onResolve({ filter: /^[^./@]/ }, (args) => {
+            if (args.path.startsWith("https://")) {
+              return { path: args.path, external: true };
+            }
+            const version = getDependencyVersion(args.path, packageJson, allDeps);
+            return { path: `https://esm.sh/${args.path}@${version}`, external: true };
+          });
+          
+          // Load virtual files
           build.onLoad({ filter: /.*/, namespace: "virtual" }, (args) => {
             const content = sourceFiles[args.path];
             if (content) {
@@ -1017,7 +1266,7 @@ Deno.serve(async (req) => {
         }
       };
       
-      const reactVersion = getDependencyVersion("react", packageJson);
+      const reactVersion = getDependencyVersion("react", packageJson, allDeps);
       
       const result = await esbuild.build({
         stdin: {
@@ -1144,8 +1393,10 @@ Deno.serve(async (req) => {
           cssSize: combinedCss.length,
           zipSize: outputZip.length,
           tailwindClasses: usedClasses.size,
-          dependencies: Object.keys(packageJson?.dependencies || {}).length,
-          devDependencies: Object.keys(packageJson?.devDependencies || {}).length,
+          dependencies: Object.keys(allDeps).length,
+          isMonorepo: monorepoInfo.isMonorepo,
+          workspacePackages: monorepoInfo.packages.length,
+          entryPackage: entryPackage?.name || null,
         }
       }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" } }

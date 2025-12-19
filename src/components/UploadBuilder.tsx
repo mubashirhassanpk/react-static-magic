@@ -17,7 +17,9 @@ interface BuildStats {
   zipSize: number;
   tailwindClasses: number;
   dependencies: number;
-  devDependencies: number;
+  isMonorepo: boolean;
+  workspacePackages: number;
+  entryPackage: string | null;
 }
 
 const UploadBuilder = () => {
@@ -207,7 +209,11 @@ const UploadBuilder = () => {
             <CheckCircle2 className="w-12 h-12 text-green-500" />
             <div className="text-center">
               <p className="text-lg font-medium text-green-500">Build successful!</p>
-              <p className="text-sm text-muted-foreground">Your static site is ready to download</p>
+              <p className="text-sm text-muted-foreground">
+                {buildStats?.isMonorepo 
+                  ? `Monorepo with ${buildStats.workspacePackages} packages built from ${buildStats.entryPackage || 'main app'}`
+                  : "Your static site is ready to download"}
+              </p>
             </div>
             
             {buildStats && (
