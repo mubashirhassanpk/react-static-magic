@@ -1,1 +1,4 @@
 project_id = "zdwasyavalwwznmzoaef"
+
+[functions.build-react]
+verify_jwt = false

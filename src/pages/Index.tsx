@@ -1,5 +1,5 @@
 import Hero from "@/components/Hero";
-import InputMethods from "@/components/InputMethods";
+import UploadBuilder from "@/components/UploadBuilder";
 import HowItWorks from "@/components/HowItWorks";
 import Features from "@/components/Features";
 import CTA from "@/components/CTA";
@@ -9,7 +9,7 @@ const Index = () => {
   return (
     <div className="min-h-screen">
       <Hero />
-      <InputMethods />
+      <UploadBuilder />
       <HowItWorks />
       <Features />
       <CTA />
