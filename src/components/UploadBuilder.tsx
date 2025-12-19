@@ -1,11 +1,18 @@
 import { useState, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Upload, Loader2, Download, CheckCircle2, XCircle, FileArchive } from "lucide-react";
+import { Upload, Loader2, Download, CheckCircle2, XCircle, FileArchive, ExternalLink, FileCode, Package } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
 
 type BuildStatus = "idle" | "uploading" | "building" | "completed" | "failed";
+
+interface BuildStats {
+  filesProcessed: number;
+  sourceFiles: number;
+  bundleSize: number;
+  cssSize: number;
+}
 
 const UploadBuilder = () => {
   const [status, setStatus] = useState<BuildStatus>("idle");
@@ -13,6 +20,7 @@ const UploadBuilder = () => {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
   const [fileName, setFileName] = useState<string | null>(null);
+  const [buildStats, setBuildStats] = useState<BuildStats | null>(null);
   const { toast } = useToast();
 
   const handleDrag = useCallback((e: React.DragEvent) => {
@@ -91,11 +99,12 @@ const UploadBuilder = () => {
 
       console.log("Build completed:", buildResult);
       setDownloadUrl(buildResult.downloadUrl);
+      setBuildStats(buildResult.stats || null);
       setStatus("completed");
       
       toast({
         title: "Build completed!",
-        description: "Your static site is ready to download",
+        description: `Processed ${buildResult.stats?.filesProcessed || 0} files`,
       });
 
     } catch (error) {
@@ -132,6 +141,15 @@ const UploadBuilder = () => {
     setDownloadUrl(null);
     setErrorMessage(null);
     setFileName(null);
+    setBuildStats(null);
+  };
+
+  const formatBytes = (bytes: number) => {
+    if (bytes === 0) return "0 B";
+    const k = 1024;
+    const sizes = ["B", "KB", "MB"];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
   };
 
   const getStatusContent = () => {
@@ -171,16 +189,45 @@ const UploadBuilder = () => {
               <p className="text-lg font-medium text-green-500">Build successful!</p>
               <p className="text-sm text-muted-foreground">Your static site is ready</p>
             </div>
+            
+            {buildStats && (
+              <div className="grid grid-cols-3 gap-4 w-full max-w-md py-4">
+                <div className="text-center p-3 rounded-lg bg-muted/50">
+                  <Package className="w-5 h-5 mx-auto mb-1 text-primary" />
+                  <div className="text-lg font-semibold">{buildStats.filesProcessed}</div>
+                  <div className="text-xs text-muted-foreground">Files</div>
+                </div>
+                <div className="text-center p-3 rounded-lg bg-muted/50">
+                  <FileCode className="w-5 h-5 mx-auto mb-1 text-accent" />
+                  <div className="text-lg font-semibold">{buildStats.sourceFiles}</div>
+                  <div className="text-xs text-muted-foreground">Source Files</div>
+                </div>
+                <div className="text-center p-3 rounded-lg bg-muted/50">
+                  <FileArchive className="w-5 h-5 mx-auto mb-1 text-primary" />
+                  <div className="text-lg font-semibold">{formatBytes(buildStats.bundleSize)}</div>
+                  <div className="text-xs text-muted-foreground">Bundle Size</div>
+                </div>
+              </div>
+            )}
+            
             <div className="flex gap-3">
               {downloadUrl && (
-                <Button asChild variant="default">
-                  <a href={downloadUrl} download target="_blank" rel="noopener noreferrer">
-                    <Download className="w-4 h-4 mr-2" />
-                    Download
-                  </a>
-                </Button>
+                <>
+                  <Button asChild variant="default">
+                    <a href={downloadUrl} download target="_blank" rel="noopener noreferrer">
+                      <Download className="w-4 h-4 mr-2" />
+                      Download
+                    </a>
+                  </Button>
+                  <Button asChild variant="outline">
+                    <a href={downloadUrl} target="_blank" rel="noopener noreferrer">
+                      <ExternalLink className="w-4 h-4 mr-2" />
+                      Preview
+                    </a>
+                  </Button>
+                </>
               )}
-              <Button variant="outline" onClick={resetState}>
+              <Button variant="ghost" onClick={resetState}>
                 Build Another
               </Button>
             </div>
