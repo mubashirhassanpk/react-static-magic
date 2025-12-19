@@ -1,6 +1,7 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
 import * as esbuild from "https://deno.land/x/esbuild@v0.20.1/wasm.js";
 import { decompressSync } from "https://esm.sh/fflate@0.8.2";
+import { zipSync, strToU8 } from "https://esm.sh/fflate@0.8.2";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -8,14 +9,27 @@ const corsHeaders = {
     "authorization, x-client-info, apikey, content-type",
 };
 
+// Build logs storage
+const buildLogs: string[] = [];
+
+function log(message: string, type: "info" | "warn" | "error" = "info") {
+  const timestamp = new Date().toISOString().substring(11, 19);
+  const prefix = type === "error" ? "❌" : type === "warn" ? "⚠️" : "→";
+  const logMessage = `[${timestamp}] ${prefix} ${message}`;
+  buildLogs.push(logMessage);
+  console.log(logMessage);
+}
+
 // Initialize esbuild WASM
 let esbuildInitialized = false;
 async function initEsbuild() {
   if (!esbuildInitialized) {
+    log("Initializing esbuild WASM...");
     await esbuild.initialize({
       wasmURL: "https://deno.land/x/esbuild@v0.20.1/esbuild.wasm",
     });
     esbuildInitialized = true;
+    log("esbuild initialized successfully");
   }
 }
 
@@ -35,7 +49,6 @@ function parseZip(data: Uint8Array): Map<string, Uint8Array> {
     
     const compressionMethod = view.getUint16(offset + 8, true);
     const compressedSize = view.getUint32(offset + 18, true);
-    const uncompressedSize = view.getUint32(offset + 22, true);
     const fileNameLength = view.getUint16(offset + 26, true);
     const extraFieldLength = view.getUint16(offset + 28, true);
     
@@ -56,7 +69,7 @@ function parseZip(data: Uint8Array): Map<string, Uint8Array> {
         // Stored (no compression)
         fileData = compressedData;
       } else {
-        console.log(`Unsupported compression method: ${compressionMethod} for ${fileName}`);
+        log(`Unsupported compression method: ${compressionMethod} for ${fileName}`, "warn");
         fileData = new Uint8Array(0);
       }
       
@@ -73,24 +86,53 @@ function parseZip(data: Uint8Array): Map<string, Uint8Array> {
   return files;
 }
 
-// Transform imports to use esm.sh CDN
-function transformImports(code: string): string {
-  // Transform React imports
-  code = code.replace(
-    /from\s+['"]react['"]/g,
-    'from "https://esm.sh/react@18.2.0"'
-  );
-  code = code.replace(
-    /from\s+['"]react-dom['"]/g,
-    'from "https://esm.sh/react-dom@18.2.0"'
-  );
-  code = code.replace(
-    /from\s+['"]react-dom\/client['"]/g,
-    'from "https://esm.sh/react-dom@18.2.0/client"'
-  );
+// Parse package.json and extract dependencies
+interface PackageJson {
+  name?: string;
+  dependencies?: Record<string, string>;
+  devDependencies?: Record<string, string>;
+}
+
+function parsePackageJson(files: Map<string, Uint8Array>): PackageJson | null {
+  const packageJsonContent = files.get("package.json");
+  if (!packageJsonContent) {
+    log("No package.json found", "warn");
+    return null;
+  }
   
-  // Transform common libraries
-  const cdnLibraries = [
+  try {
+    const content = new TextDecoder().decode(packageJsonContent);
+    const parsed = JSON.parse(content) as PackageJson;
+    log(`Parsed package.json: ${parsed.name || "unnamed project"}`);
+    return parsed;
+  } catch (e) {
+    log(`Failed to parse package.json: ${e}`, "error");
+    return null;
+  }
+}
+
+// Get version from package.json or use latest
+function getDependencyVersion(
+  dep: string,
+  packageJson: PackageJson | null
+): string {
+  const version = packageJson?.dependencies?.[dep] || packageJson?.devDependencies?.[dep];
+  if (version) {
+    // Clean version string (remove ^, ~, etc.)
+    return version.replace(/^[\^~><=]+/, "");
+  }
+  return "latest";
+}
+
+// Transform imports to use esm.sh CDN with package.json versions
+function transformImports(code: string, packageJson: PackageJson | null): { code: string; warnings: string[] } {
+  const warnings: string[] = [];
+  
+  // Common React ecosystem packages
+  const knownPackages = [
+    "react",
+    "react-dom",
+    "react-dom/client",
     "react-router-dom",
     "@tanstack/react-query",
     "zustand",
@@ -99,19 +141,80 @@ function transformImports(code: string): string {
     "lucide-react",
     "clsx",
     "tailwind-merge",
+    "date-fns",
+    "lodash",
+    "uuid",
+    "@radix-ui/react-accordion",
+    "@radix-ui/react-alert-dialog",
+    "@radix-ui/react-avatar",
+    "@radix-ui/react-checkbox",
+    "@radix-ui/react-dialog",
+    "@radix-ui/react-dropdown-menu",
+    "@radix-ui/react-label",
+    "@radix-ui/react-popover",
+    "@radix-ui/react-select",
+    "@radix-ui/react-slot",
+    "@radix-ui/react-switch",
+    "@radix-ui/react-tabs",
+    "@radix-ui/react-toast",
+    "@radix-ui/react-tooltip",
   ];
-  
-  for (const lib of cdnLibraries) {
-    const escapedLib = lib.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const regex = new RegExp(`from\\s+['"]${escapedLib}['"]`, "g");
-    code = code.replace(regex, `from "https://esm.sh/${lib}"`);
+
+  // Build dependency map from package.json
+  const allDeps = {
+    ...packageJson?.dependencies,
+    ...packageJson?.devDependencies,
+  };
+
+  // Transform known packages with versions from package.json
+  for (const pkg of knownPackages) {
+    const escapedPkg = pkg.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const regex = new RegExp(`from\\s+['"]${escapedPkg}['"]`, "g");
+    if (code.match(regex)) {
+      const version = getDependencyVersion(pkg, packageJson);
+      const cdnUrl = `https://esm.sh/${pkg}@${version}`;
+      code = code.replace(regex, `from "${cdnUrl}"`);
+      log(`Mapped ${pkg}@${version} to esm.sh`);
+    }
   }
-  
-  return code;
+
+  // Transform any remaining bare imports from package.json dependencies
+  if (allDeps) {
+    for (const [dep, version] of Object.entries(allDeps)) {
+      if (!knownPackages.includes(dep)) {
+        const escapedDep = dep.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const regex = new RegExp(`from\\s+['"]${escapedDep}['"]`, "g");
+        if (code.match(regex)) {
+          const cleanVersion = (version as string).replace(/^[\^~><=]+/, "");
+          code = code.replace(regex, `from "https://esm.sh/${dep}@${cleanVersion}"`);
+          log(`Mapped ${dep}@${cleanVersion} to esm.sh`);
+        }
+      }
+    }
+  }
+
+  return { code, warnings };
 }
 
 // Generate index.html
-function generateHtml(bundledJs: string, bundledCss: string): string {
+function generateHtml(jsFileName: string, cssFileName: string): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Built React App</title>
+  <link rel="stylesheet" href="./${cssFileName}">
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module" src="./${jsFileName}"></script>
+</body>
+</html>`;
+}
+
+// Generate inline HTML for preview
+function generateInlineHtml(bundledJs: string, bundledCss: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -136,6 +239,9 @@ Deno.serve(async (req) => {
     return new Response(null, { headers: corsHeaders });
   }
 
+  // Clear logs for new build
+  buildLogs.length = 0;
+
   try {
     await initEsbuild();
     
@@ -147,12 +253,12 @@ Deno.serve(async (req) => {
 
     if (!jobId) {
       return new Response(
-        JSON.stringify({ success: false, error: "Job ID is required" }),
+        JSON.stringify({ success: false, error: "Job ID is required", logs: buildLogs }),
         { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
-    console.log(`Processing build job: ${jobId}`);
+    log(`Starting build job: ${jobId}`);
 
     // Get the build job
     const { data: job, error: jobError } = await supabase
@@ -162,9 +268,9 @@ Deno.serve(async (req) => {
       .maybeSingle();
 
     if (jobError || !job) {
-      console.error("Job not found:", jobError);
+      log("Build job not found", "error");
       return new Response(
-        JSON.stringify({ success: false, error: "Build job not found" }),
+        JSON.stringify({ success: false, error: "Build job not found", logs: buildLogs }),
         { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
@@ -175,7 +281,7 @@ Deno.serve(async (req) => {
       .update({ status: "processing" })
       .eq("id", jobId);
 
-    console.log(`Downloading input file: ${job.input_file_path}`);
+    log(`Downloading input file: ${job.input_file_path}`);
 
     // Download the uploaded ZIP file
     const { data: fileData, error: downloadError } = await supabase.storage
@@ -183,7 +289,7 @@ Deno.serve(async (req) => {
       .download(job.input_file_path);
 
     if (downloadError || !fileData) {
-      console.error("Failed to download file:", downloadError);
+      log(`Failed to download file: ${downloadError?.message}`, "error");
       await supabase
         .from("build_jobs")
         .update({ 
@@ -193,12 +299,12 @@ Deno.serve(async (req) => {
         })
         .eq("id", jobId);
       return new Response(
-        JSON.stringify({ success: false, error: "Failed to download uploaded file" }),
+        JSON.stringify({ success: false, error: "Failed to download uploaded file", logs: buildLogs }),
         { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
-    console.log(`File downloaded, size: ${fileData.size} bytes`);
+    log(`File downloaded, size: ${(fileData.size / 1024).toFixed(1)} KB`);
 
     // Parse ZIP file
     const zipData = new Uint8Array(await fileData.arrayBuffer());
@@ -206,9 +312,17 @@ Deno.serve(async (req) => {
     
     try {
       files = parseZip(zipData);
-      console.log(`Extracted ${files.size} files from ZIP`);
+      log(`Extracted ${files.size} files from ZIP`);
+      
+      // Log file structure
+      const dirs = new Set<string>();
+      for (const path of files.keys()) {
+        const dir = path.includes("/") ? path.substring(0, path.lastIndexOf("/")) : ".";
+        dirs.add(dir);
+      }
+      log(`Project directories: ${Array.from(dirs).slice(0, 5).join(", ")}${dirs.size > 5 ? "..." : ""}`);
     } catch (zipError) {
-      console.error("Failed to parse ZIP:", zipError);
+      log(`Failed to parse ZIP: ${zipError}`, "error");
       await supabase
         .from("build_jobs")
         .update({ 
@@ -218,9 +332,25 @@ Deno.serve(async (req) => {
         })
         .eq("id", jobId);
       return new Response(
-        JSON.stringify({ success: false, error: "Failed to parse ZIP file" }),
+        JSON.stringify({ success: false, error: "Failed to parse ZIP file", logs: buildLogs }),
         { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
+    }
+
+    // Parse package.json for dependencies
+    log("Parsing package.json for dependencies...");
+    const packageJson = parsePackageJson(files);
+    
+    if (packageJson) {
+      const depCount = Object.keys(packageJson.dependencies || {}).length;
+      const devDepCount = Object.keys(packageJson.devDependencies || {}).length;
+      log(`Found ${depCount} dependencies and ${devDepCount} dev dependencies`);
+      
+      // Log key dependencies
+      const deps = Object.keys(packageJson.dependencies || {});
+      if (deps.length > 0) {
+        log(`Key deps: ${deps.slice(0, 5).join(", ")}${deps.length > 5 ? "..." : ""}`);
+      }
     }
 
     // Find entry point (main.tsx, main.jsx, index.tsx, index.jsx, App.tsx, App.jsx)
@@ -237,7 +367,7 @@ Deno.serve(async (req) => {
     }
 
     if (!entryPoint || !entryContent) {
-      console.error("No entry point found");
+      log("No entry point found (src/main.tsx, etc.)", "error");
       await supabase
         .from("build_jobs")
         .update({ 
@@ -247,34 +377,49 @@ Deno.serve(async (req) => {
         })
         .eq("id", jobId);
       return new Response(
-        JSON.stringify({ success: false, error: "No entry point found" }),
+        JSON.stringify({ success: false, error: "No entry point found", logs: buildLogs }),
         { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
-    console.log(`Found entry point: ${entryPoint}`);
+    log(`Found entry point: ${entryPoint}`);
 
     // Collect all source files for bundling
     const sourceFiles: Record<string, string> = {};
+    const allWarnings: string[] = [];
+    let sourceFileCount = 0;
+    
     for (const [path, content] of files) {
       if (path.endsWith(".tsx") || path.endsWith(".ts") || path.endsWith(".jsx") || path.endsWith(".js")) {
         let code = new TextDecoder().decode(content);
-        code = transformImports(code);
-        sourceFiles[path] = code;
+        const { code: transformedCode, warnings } = transformImports(code, packageJson);
+        sourceFiles[path] = transformedCode;
+        allWarnings.push(...warnings);
+        sourceFileCount++;
       }
     }
+    
+    log(`Processing ${sourceFileCount} source files`);
 
     // Collect CSS files
     let combinedCss = "";
+    let cssFileCount = 0;
     for (const [path, content] of files) {
       if (path.endsWith(".css")) {
-        combinedCss += new TextDecoder().decode(content) + "\n";
+        combinedCss += `/* ${path} */\n` + new TextDecoder().decode(content) + "\n\n";
+        cssFileCount++;
       }
     }
+    
+    log(`Found ${cssFileCount} CSS files`);
 
-    console.log(`Processing ${Object.keys(sourceFiles).length} source files and CSS`);
+    // Log warnings
+    for (const warning of allWarnings) {
+      log(warning, "warn");
+    }
 
     // Bundle with esbuild
+    log("Starting esbuild bundling...");
     let bundledJs = "";
     try {
       // Create a virtual file system plugin
@@ -303,7 +448,9 @@ Deno.serve(async (req) => {
             if (args.path.startsWith("https://")) {
               return { path: args.path, external: true };
             }
-            return { path: `https://esm.sh/${args.path}`, external: true };
+            // Use version from package.json if available
+            const version = getDependencyVersion(args.path, packageJson);
+            return { path: `https://esm.sh/${args.path}@${version}`, external: true };
           });
           
           // Load virtual files
@@ -319,6 +466,8 @@ Deno.serve(async (req) => {
         }
       };
       
+      const reactVersion = getDependencyVersion("react", packageJson);
+      
       const result = await esbuild.build({
         stdin: {
           contents: sourceFiles[entryPoint] || entryContent,
@@ -332,13 +481,18 @@ Deno.serve(async (req) => {
         write: false,
         plugins: [virtualFs],
         jsx: "automatic",
-        jsxImportSource: "https://esm.sh/react@18.2.0",
+        jsxImportSource: `https://esm.sh/react@${reactVersion}`,
       });
       
       bundledJs = new TextDecoder().decode(result.outputFiles[0].contents);
-      console.log(`Bundled JS size: ${bundledJs.length} characters`);
+      log(`Bundle complete: ${(bundledJs.length / 1024).toFixed(1)} KB (minified)`);
+      
+      // Log any esbuild warnings
+      for (const warning of result.warnings) {
+        log(`esbuild: ${warning.text}`, "warn");
+      }
     } catch (bundleError) {
-      console.error("Bundle error:", bundleError);
+      log(`Bundle error: ${bundleError}`, "error");
       const errorMessage = bundleError instanceof Error ? bundleError.message : "Unknown build error";
       await supabase
         .from("build_jobs")
@@ -349,27 +503,65 @@ Deno.serve(async (req) => {
         })
         .eq("id", jobId);
       return new Response(
-        JSON.stringify({ success: false, error: `Build failed: ${errorMessage}` }),
+        JSON.stringify({ success: false, error: `Build failed: ${errorMessage}`, logs: buildLogs }),
         { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
-    // Generate final HTML
-    const finalHtml = generateHtml(bundledJs, combinedCss);
+    // Create ZIP file with all assets
+    log("Creating ZIP archive with all assets...");
     
-    const outputPath = `${jobId}/index.html`;
-    console.log(`Uploading build output to: ${outputPath}`);
+    const zipFiles: Record<string, Uint8Array> = {
+      "index.html": strToU8(generateHtml("bundle.js", "styles.css")),
+      "bundle.js": strToU8(bundledJs),
+      "styles.css": strToU8(combinedCss),
+    };
+    
+    // Include any static assets from public folder
+    let assetCount = 0;
+    for (const [path, content] of files) {
+      if (path.startsWith("public/") && !path.endsWith("/")) {
+        const assetPath = path.replace("public/", "");
+        zipFiles[assetPath] = content;
+        assetCount++;
+      }
+    }
+    
+    if (assetCount > 0) {
+      log(`Included ${assetCount} static assets from public folder`);
+    }
 
-    // Upload the built output
-    const { error: uploadError } = await supabase.storage
+    const outputZip = zipSync(zipFiles, { level: 9 });
+    log(`ZIP created: ${(outputZip.length / 1024).toFixed(1)} KB`);
+
+    // Upload ZIP file
+    const zipOutputPath = `${jobId}/build.zip`;
+    log(`Uploading build.zip...`);
+
+    const { error: zipUploadError } = await supabase.storage
       .from("static-builds")
-      .upload(outputPath, new TextEncoder().encode(finalHtml), {
+      .upload(zipOutputPath, outputZip, {
+        contentType: "application/zip",
+        upsert: true
+      });
+
+    if (zipUploadError) {
+      log(`Failed to upload ZIP: ${zipUploadError.message}`, "error");
+    }
+
+    // Also upload inline HTML for preview
+    const inlineHtml = generateInlineHtml(bundledJs, combinedCss);
+    const htmlOutputPath = `${jobId}/index.html`;
+    
+    const { error: htmlUploadError } = await supabase.storage
+      .from("static-builds")
+      .upload(htmlOutputPath, new TextEncoder().encode(inlineHtml), {
         contentType: "text/html",
         upsert: true
       });
 
-    if (uploadError) {
-      console.error("Failed to upload build output:", uploadError);
+    if (htmlUploadError) {
+      log(`Failed to upload preview HTML: ${htmlUploadError.message}`, "error");
       await supabase
         .from("build_jobs")
         .update({ 
@@ -379,7 +571,7 @@ Deno.serve(async (req) => {
         })
         .eq("id", jobId);
       return new Response(
-        JSON.stringify({ success: false, error: "Failed to save build output" }),
+        JSON.stringify({ success: false, error: "Failed to save build output", logs: buildLogs }),
         { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
@@ -389,38 +581,48 @@ Deno.serve(async (req) => {
       .from("build_jobs")
       .update({ 
         status: "completed", 
-        output_file_path: outputPath,
+        output_file_path: zipOutputPath,
         completed_at: new Date().toISOString()
       })
       .eq("id", jobId);
 
-    // Get public URL for the output
-    const { data: publicUrlData } = supabase.storage
+    // Get public URLs
+    const { data: zipUrlData } = supabase.storage
       .from("static-builds")
-      .getPublicUrl(outputPath);
+      .getPublicUrl(zipOutputPath);
 
-    console.log(`Build completed successfully for job: ${jobId}`);
+    const { data: previewUrlData } = supabase.storage
+      .from("static-builds")
+      .getPublicUrl(htmlOutputPath);
+
+    log("✅ Build completed successfully!");
 
     return new Response(
       JSON.stringify({ 
         success: true, 
-        downloadUrl: publicUrlData.publicUrl,
+        downloadUrl: zipUrlData.publicUrl,
+        previewUrl: previewUrlData.publicUrl,
         message: "Build completed successfully",
+        logs: buildLogs,
         stats: {
           filesProcessed: files.size,
-          sourceFiles: Object.keys(sourceFiles).length,
+          sourceFiles: sourceFileCount,
+          cssFiles: cssFileCount,
           bundleSize: bundledJs.length,
-          cssSize: combinedCss.length
+          cssSize: combinedCss.length,
+          zipSize: outputZip.length,
+          dependencies: Object.keys(packageJson?.dependencies || {}).length,
+          devDependencies: Object.keys(packageJson?.devDependencies || {}).length,
         }
       }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
 
   } catch (error) {
-    console.error("Build error:", error);
+    log(`Unexpected error: ${error}`, "error");
     const errorMessage = error instanceof Error ? error.message : "Build failed";
     return new Response(
-      JSON.stringify({ success: false, error: errorMessage }),
+      JSON.stringify({ success: false, error: errorMessage, logs: buildLogs }),
       { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   }

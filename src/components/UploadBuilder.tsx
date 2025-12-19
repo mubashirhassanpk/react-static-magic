@@ -1,26 +1,33 @@
 import { useState, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Upload, Loader2, Download, CheckCircle2, XCircle, FileArchive, ExternalLink, FileCode, Package } from "lucide-react";
+import { Upload, Loader2, Download, CheckCircle2, XCircle, FileArchive, ExternalLink, FileCode, Package, Layers } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
+import BuildLogViewer from "./BuildLogViewer";
 
 type BuildStatus = "idle" | "uploading" | "building" | "completed" | "failed";
 
 interface BuildStats {
   filesProcessed: number;
   sourceFiles: number;
+  cssFiles: number;
   bundleSize: number;
   cssSize: number;
+  zipSize: number;
+  dependencies: number;
+  devDependencies: number;
 }
 
 const UploadBuilder = () => {
   const [status, setStatus] = useState<BuildStatus>("idle");
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
   const [fileName, setFileName] = useState<string | null>(null);
   const [buildStats, setBuildStats] = useState<BuildStats | null>(null);
+  const [buildLogs, setBuildLogs] = useState<string[]>([]);
   const { toast } = useToast();
 
   const handleDrag = useCallback((e: React.DragEvent) => {
@@ -47,13 +54,16 @@ const UploadBuilder = () => {
     setStatus("uploading");
     setErrorMessage(null);
     setDownloadUrl(null);
+    setPreviewUrl(null);
+    setBuildLogs([]);
+    setBuildStats(null);
 
     try {
       // Generate unique file path
       const timestamp = Date.now();
       const filePath = `${timestamp}/${file.name}`;
 
-      console.log("Uploading file:", filePath);
+      setBuildLogs(prev => [...prev, `[${new Date().toISOString().substring(11, 19)}] → Uploading ${file.name}...`]);
 
       // Upload to storage
       const { error: uploadError } = await supabase.storage
@@ -64,7 +74,7 @@ const UploadBuilder = () => {
         throw new Error(`Upload failed: ${uploadError.message}`);
       }
 
-      console.log("File uploaded, creating build job...");
+      setBuildLogs(prev => [...prev, `[${new Date().toISOString().substring(11, 19)}] → Upload complete, creating build job...`]);
 
       // Create build job
       const { data: job, error: jobError } = await supabase
@@ -80,7 +90,7 @@ const UploadBuilder = () => {
         throw new Error(`Failed to create build job: ${jobError?.message}`);
       }
 
-      console.log("Build job created:", job.id);
+      setBuildLogs(prev => [...prev, `[${new Date().toISOString().substring(11, 19)}] → Build job created: ${job.id.substring(0, 8)}...`]);
       setStatus("building");
 
       // Trigger the build function
@@ -93,12 +103,17 @@ const UploadBuilder = () => {
         throw new Error(`Build failed: ${buildError.message}`);
       }
 
+      // Update logs from build result
+      if (buildResult.logs && Array.isArray(buildResult.logs)) {
+        setBuildLogs(buildResult.logs);
+      }
+
       if (!buildResult.success) {
         throw new Error(buildResult.error || "Build failed");
       }
 
-      console.log("Build completed:", buildResult);
       setDownloadUrl(buildResult.downloadUrl);
+      setPreviewUrl(buildResult.previewUrl);
       setBuildStats(buildResult.stats || null);
       setStatus("completed");
       
@@ -139,9 +154,11 @@ const UploadBuilder = () => {
   const resetState = () => {
     setStatus("idle");
     setDownloadUrl(null);
+    setPreviewUrl(null);
     setErrorMessage(null);
     setFileName(null);
     setBuildStats(null);
+    setBuildLogs([]);
   };
 
   const formatBytes = (bytes: number) => {
@@ -162,6 +179,7 @@ const UploadBuilder = () => {
               <p className="text-lg font-medium">Uploading project...</p>
               <p className="text-sm text-muted-foreground">{fileName}</p>
             </div>
+            <BuildLogViewer logs={buildLogs} isBuilding={true} />
           </div>
         );
 
@@ -176,8 +194,9 @@ const UploadBuilder = () => {
             </div>
             <div className="text-center">
               <p className="text-lg font-medium">Building static site...</p>
-              <p className="text-sm text-muted-foreground">Running npm install &amp; npm run build</p>
+              <p className="text-sm text-muted-foreground">Bundling with esbuild &amp; resolving dependencies</p>
             </div>
+            <BuildLogViewer logs={buildLogs} isBuilding={true} />
           </div>
         );
 
@@ -187,15 +206,15 @@ const UploadBuilder = () => {
             <CheckCircle2 className="w-12 h-12 text-green-500" />
             <div className="text-center">
               <p className="text-lg font-medium text-green-500">Build successful!</p>
-              <p className="text-sm text-muted-foreground">Your static site is ready</p>
+              <p className="text-sm text-muted-foreground">Your static site is ready to download</p>
             </div>
             
             {buildStats && (
-              <div className="grid grid-cols-3 gap-4 w-full max-w-md py-4">
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4 w-full max-w-2xl py-4">
                 <div className="text-center p-3 rounded-lg bg-muted/50">
                   <Package className="w-5 h-5 mx-auto mb-1 text-primary" />
                   <div className="text-lg font-semibold">{buildStats.filesProcessed}</div>
-                  <div className="text-xs text-muted-foreground">Files</div>
+                  <div className="text-xs text-muted-foreground">Total Files</div>
                 </div>
                 <div className="text-center p-3 rounded-lg bg-muted/50">
                   <FileCode className="w-5 h-5 mx-auto mb-1 text-accent" />
@@ -203,34 +222,41 @@ const UploadBuilder = () => {
                   <div className="text-xs text-muted-foreground">Source Files</div>
                 </div>
                 <div className="text-center p-3 rounded-lg bg-muted/50">
-                  <FileArchive className="w-5 h-5 mx-auto mb-1 text-primary" />
-                  <div className="text-lg font-semibold">{formatBytes(buildStats.bundleSize)}</div>
-                  <div className="text-xs text-muted-foreground">Bundle Size</div>
+                  <Layers className="w-5 h-5 mx-auto mb-1 text-primary" />
+                  <div className="text-lg font-semibold">{buildStats.dependencies}</div>
+                  <div className="text-xs text-muted-foreground">Dependencies</div>
+                </div>
+                <div className="text-center p-3 rounded-lg bg-muted/50">
+                  <FileArchive className="w-5 h-5 mx-auto mb-1 text-green-500" />
+                  <div className="text-lg font-semibold">{formatBytes(buildStats.zipSize)}</div>
+                  <div className="text-xs text-muted-foreground">ZIP Size</div>
                 </div>
               </div>
             )}
             
-            <div className="flex gap-3">
+            <div className="flex flex-wrap gap-3 justify-center">
               {downloadUrl && (
-                <>
-                  <Button asChild variant="default">
-                    <a href={downloadUrl} download target="_blank" rel="noopener noreferrer">
-                      <Download className="w-4 h-4 mr-2" />
-                      Download
-                    </a>
-                  </Button>
-                  <Button asChild variant="outline">
-                    <a href={downloadUrl} target="_blank" rel="noopener noreferrer">
-                      <ExternalLink className="w-4 h-4 mr-2" />
-                      Preview
-                    </a>
-                  </Button>
-                </>
+                <Button asChild variant="default">
+                  <a href={downloadUrl} download target="_blank" rel="noopener noreferrer">
+                    <Download className="w-4 h-4 mr-2" />
+                    Download ZIP
+                  </a>
+                </Button>
+              )}
+              {previewUrl && (
+                <Button asChild variant="outline">
+                  <a href={previewUrl} target="_blank" rel="noopener noreferrer">
+                    <ExternalLink className="w-4 h-4 mr-2" />
+                    Preview
+                  </a>
+                </Button>
               )}
               <Button variant="ghost" onClick={resetState}>
                 Build Another
               </Button>
             </div>
+            
+            <BuildLogViewer logs={buildLogs} isBuilding={false} />
           </div>
         );
 
@@ -245,6 +271,7 @@ const UploadBuilder = () => {
             <Button variant="outline" onClick={resetState}>
               Try Again
             </Button>
+            <BuildLogViewer logs={buildLogs} isBuilding={false} />
           </div>
         );
 
